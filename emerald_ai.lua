@@ -29,13 +29,26 @@ local CONFIG = {
   novelty_reward = 0.5,       -- reward for first time seeing a coarse cell
   stuck_penalty = -0.5,
   small_move_reward = 0.05,   -- tiny reward for movement (encourage walking)
-
   -- Phase/interaction shaping
   phase_stagnant_threshold_steps = 20, -- steps without movement to consider as interaction
   interaction_exit_reward = 1.0,       -- reward for leaving long interaction/battle/menu phases
   long_interaction_penalty = -0.2,     -- periodic penalty during very long interactions
   max_interaction_steps_without_exit = 200, -- after which we inject exploration
   macro_hold_frames = 6,               -- default hold for macro button taps
+
+  -- Higher-level shaping
+  catch_attempt_window_frames = 1200,  -- ~20s window to attribute catch
+  catch_reward = 5.0,
+  warp_reward = 1.0,
+  new_map_reward = 1.0,
+  badge_reward = 20.0,
+  warp_distance_threshold = 24,        -- XY manhattan distance to count as warp/transition
+
+  -- Savestates / episodes
+  savestate_enable = true,
+  savestate_slots = 5,
+  savestate_save_every_new_cells = 100,
+  no_novelty_reset_frames = 6000,
 
   -- Coordinate detection
   calib_move_frames = 18,
@@ -49,6 +62,13 @@ local CONFIG = {
   -- Coarse grid for novelty map
   coarse_cell_size = 4,        -- pixels per cell
   novelty_map_capacity = 100000,
+
+  -- Optional manual memory hints (hex strings like '0x0203ABCD' or numbers)
+  hints = {
+    pokedex_caught_addr = nil,
+    map_id_addr = nil,
+    badge_flags_addr = nil,
+  },
 
   -- Logging verbosity
   log_every_n_steps = 200,
@@ -291,21 +311,36 @@ local function save_qtable()
 end
 
 -------------------------------------------------------------------------------
--- Calibration: auto-detect player X/Y coordinates by memory diff
+-- Calibration + Feature Detection Persistence
 -------------------------------------------------------------------------------
 local CALIB = {
   player_x_addr = nil,
   player_y_addr = nil,
   addr_domain = 'auto',
+  caught_counter_addr = nil,   -- optional autodetected Pokédex caught counter (u16)
+  map_id_addr = nil,           -- optional autodetected map id (u16)
+  badge_flags_addr = nil,      -- optional autodetected badge flags (u16/32)
 }
 
 local function save_calib()
   local path = CONFIG.save_dir .. '/' .. CONFIG.calib_filename
   local lines = {}
   for k, v in pairs(CALIB) do
-    table.insert(lines, string.format('%s\t%s', k, tostring(v)))
+    if type(v) == 'number' then
+      table.insert(lines, string.format('%s\t0x%08X', k, v))
+    else
+      table.insert(lines, string.format('%s\t%s', k, tostring(v)))
+    end
   end
   write_file(path, table.concat(lines, '\n'))
+end
+
+local function parse_hex_or_num(s)
+  if not s or s == 'nil' then return nil end
+  if type(s) == 'number' then return s end
+  local hex = s:match('^0x([0-9a-fA-F]+)$')
+  if hex then return tonumber(hex, 16) end
+  return tonumber(s)
 end
 
 local function load_calib()
@@ -315,13 +350,15 @@ local function load_calib()
   for line in content:gmatch('[^\n]+') do
     local k, v = line:match('^(%w+)\t(.+)$')
     if k and v then
-      if v == 'nil' then CALIB[k] = nil
-      elseif tonumber(v) then CALIB[k] = tonumber(v)
-      else CALIB[k] = v end
+      local num = parse_hex_or_num(v)
+      if num ~= nil then CALIB[k] = num else CALIB[k] = v end
     end
   end
 end
 
+-------------------------------------------------------------------------------
+-- Region Snapshots and XY Calibration
+-------------------------------------------------------------------------------
 local function snapshot_region(region)
   local bytes = read_bytes(region.start_addr, region.size)
   return bytes
@@ -359,8 +396,6 @@ local function try_find_xy_in_region(region, dir)
   local reverse = ({Up='Down', Down='Up', Left='Right', Right='Left'})[dir]
   if reverse then press_button(reverse, CONFIG.calib_move_frames) end
   local cands = diff_candidates(base, moved)
-  -- Try to disambiguate X vs Y using horizontal vs vertical movement expectations
-  -- We'll store the top 2 candidates, then verify across orthogonal movement.
   return cands
 end
 
@@ -448,6 +483,12 @@ local NOVEL = {
   keys = {}, -- ring buffer of keys for capacity control
 }
 
+local PROGRESS = {
+  unique_cells_total = 0,
+  last_novelty_frame = 0,
+  last_warp_frame = 0,
+}
+
 local function coarse_cell(x, y)
   if not x or not y then return 'unknown:unknown' end
   local cs = CONFIG.coarse_cell_size
@@ -465,11 +506,16 @@ local function novelty_reward_for_cell(cell)
     local ov = NOVEL.visits[old] or 1
     if ov <= 1 then NOVEL.visits[old] = nil end
   end
-  if v == 0 then return CONFIG.novelty_reward end
+  if v == 0 then
+    PROGRESS.unique_cells_total = PROGRESS.unique_cells_total + 1
+    PROGRESS.last_novelty_frame = now_frame()
+    return CONFIG.novelty_reward
+  end
   return 0.0
 end
 
 -- Phase-aware state hash
+local PHASE -- forward declare for hash_state
 local function hash_state(x, y)
   if not x or not y then return 'noXY' end
   local cell = coarse_cell(x, y)
@@ -481,7 +527,7 @@ end
 -------------------------------------------------------------------------------
 -- Phase Detection and Dynamic Actions
 -------------------------------------------------------------------------------
-local PHASE = {
+PHASE = {
   mode = 'overworld',  -- 'overworld' or 'interaction'
   stagnant_steps = 0,
   frames_in_mode = 0,
@@ -533,6 +579,8 @@ local ACTION_DEFS = {
   { name = 'RunFromBattle', phase = 'interaction', exec = function() run_macro({ 'Down', 'Right', 'A' }) end },
   -- Attempt to throw a Poké Ball quickly: Right->Bag, A, Down (to Balls), A, A (use first ball)
   { name = 'BagThrowBallQuick', phase = 'interaction', exec = function() run_macro({ 'Right', 'A', 'Down', 'A', 'A' }) end },
+  -- Attempt to fight using first move (A to Fight, A to first move)
+  { name = 'FightFirst', phase = 'interaction', exec = function() run_macro({ 'A', 'A' }) end },
 }
 
 local function get_available_actions_for_phase(phase)
@@ -549,6 +597,137 @@ local function exec_action_by_name(name)
   end
   -- Fallback if unknown: press as single button
   tap(name)
+end
+
+-------------------------------------------------------------------------------
+-- Feature Detection: Catch counter and optional map/badges
+-------------------------------------------------------------------------------
+local DETECT = {
+  catch = { candidates = {}, best_addr = nil, prev_value = nil },
+  map = { best_addr = nil, prev_value = nil },
+  badges = { best_addr = nil, prev_value = nil },
+}
+
+local function record_catch_candidate(abs_addr)
+  local s = DETECT.catch.candidates[abs_addr] or 0
+  DETECT.catch.candidates[abs_addr] = s + 1
+  -- Promote best if high confidence
+  local best = DETECT.catch.best_addr
+  if not best or DETECT.catch.candidates[abs_addr] > (DETECT.catch.candidates[best] or -1) then
+    DETECT.catch.best_addr = abs_addr
+    CALIB.caught_counter_addr = abs_addr
+    save_calib()
+  end
+end
+
+local function try_load_hints()
+  local h = CONFIG.hints
+  if h then
+    if h.pokedex_caught_addr then CALIB.caught_counter_addr = parse_hex_or_num(h.pokedex_caught_addr) end
+    if h.map_id_addr then CALIB.map_id_addr = parse_hex_or_num(h.map_id_addr) end
+    if h.badge_flags_addr then CALIB.badge_flags_addr = parse_hex_or_num(h.badge_flags_addr) end
+  end
+end
+
+local function read_optional_u16(addr)
+  if not addr then return nil end
+  local ok, val = pcall(read_u16_le, addr)
+  if ok then return val end
+  return nil
+end
+
+local function on_possible_catch_event(before_snaps, after_snaps, regions)
+  -- Scan for +1 in 16-bit counters across regions; record candidates
+  for _, region in ipairs(regions) do
+    local before = before_snaps[region.name]
+    local after = after_snaps[region.name]
+    if before and after then
+      local size = math.min(#before, #after)
+      for i = 1, size - 1, 2 do
+        local vb = before[i] + 256 * before[i + 1]
+        local va = after[i] + 256 * after[i + 1]
+        if va - vb == 1 then
+          local abs_addr = region.start_addr + (i - 1)
+          record_catch_candidate(abs_addr)
+        end
+      end
+    end
+  end
+end
+
+-------------------------------------------------------------------------------
+-- Savestate Manager
+-------------------------------------------------------------------------------
+local SAVE = {
+  enabled = false,
+  strategy = nil, -- 'slot' or 'file'
+  next_slot = 1,
+  saved_slots = 0,
+  last_saved_unique_cells = 0,
+}
+
+local function save_slot(idx)
+  if not SAVE.enabled then return false end
+  if SAVE.strategy == 'slot' and savestate and savestate.saveslot then
+    local ok = pcall(savestate.saveslot, idx)
+    return ok
+  elseif SAVE.strategy == 'file' and savestate and savestate.save then
+    local path = string.format('%s/emerald_ai_slot_%d.State', CONFIG.save_dir, idx)
+    local ok = pcall(savestate.save, path)
+    return ok
+  end
+  return false
+end
+
+local function load_slot(idx)
+  if not SAVE.enabled then return false end
+  if SAVE.strategy == 'slot' and savestate and savestate.loadslot then
+    local ok = pcall(savestate.loadslot, idx)
+    return ok
+  elseif SAVE.strategy == 'file' and savestate and savestate.load then
+    local path = string.format('%s/emerald_ai_slot_%d.State', CONFIG.save_dir, idx)
+    local ok = pcall(savestate.load, path)
+    return ok
+  end
+  return false
+end
+
+local function maybe_save_progress()
+  if not SAVE.enabled then return end
+  if PROGRESS.unique_cells_total - SAVE.last_saved_unique_cells >= CONFIG.savestate_save_every_new_cells then
+    local idx = SAVE.next_slot
+    if save_slot(idx) then
+      SAVE.saved_slots = math.max(SAVE.saved_slots, idx)
+      SAVE.next_slot = (idx % CONFIG.savestate_slots) + 1
+      SAVE.last_saved_unique_cells = PROGRESS.unique_cells_total
+      log_line(string.format('Savestate saved to slot %d at unique_cells=%d', idx, PROGRESS.unique_cells_total))
+    end
+  end
+end
+
+local function maybe_reset_no_progress()
+  if not SAVE.enabled then return end
+  local frame = now_frame()
+  if (frame - PROGRESS.last_novelty_frame) >= CONFIG.no_novelty_reset_frames and SAVE.saved_slots > 0 then
+    local idx = math.random(1, math.min(SAVE.saved_slots, CONFIG.savestate_slots))
+    if load_slot(idx) then
+      PROGRESS.last_novelty_frame = now_frame()
+      log_line(string.format('Savestate loaded from slot %d due to no novelty', idx))
+    end
+  end
+end
+
+local function detect_savestate_capabilities()
+  if not CONFIG.savestate_enable or not savestate then return end
+  if savestate.saveslot and savestate.loadslot then
+    SAVE.strategy = 'slot'
+    SAVE.enabled = true
+  elseif savestate.save and savestate.load then
+    SAVE.strategy = 'file'
+    SAVE.enabled = true
+  else
+    SAVE.enabled = false
+  end
 end
 
 -------------------------------------------------------------------------------
@@ -599,12 +778,17 @@ local function step_action(action)
   if x0 and y0 and x1 and y1 then
     local moved = (x0 ~= x1) or (y0 ~= y1)
     if moved then reward = reward + CONFIG.small_move_reward end
+    -- Warp detection by large XY jump
+    local manhattan = (x0 and x1) and (math.abs(x1 - x0) + math.abs(y1 - y0)) or 0
+    if manhattan >= CONFIG.warp_distance_threshold then
+      reward = reward + CONFIG.warp_reward
+      PROGRESS.last_warp_frame = now_frame()
+    end
   end
 
   -- Novelty based on coarse cell
   reward = reward + novelty_reward_for_cell(coarse_cell(x1, y1))
 
-  -- Stuck penalty if no coordinate access or no movement for many steps handled elsewhere
   return { x = x1, y = y1, reward = reward }
 end
 
@@ -623,22 +807,47 @@ end
 -------------------------------------------------------------------------------
 local function ensure_calibrated()
   load_calib()
+  try_load_hints()
   if CALIB.player_x_addr and CALIB.player_y_addr then return true end
   return auto_calibrate_xy()
 end
+
+local RECENT = {
+  catch_attempt_frame = nil,
+  catch_snap_before = nil, -- table by region name to byte array
+  last_xy = { x = nil, y = nil, stagnant = 0 },
+}
 
 local function init()
   math.randomseed(os.time() % 2147483647)
   load_meta()
   load_qtable()
   ensure_calibrated()
+  detect_savestate_capabilities()
+  if SAVE.enabled then
+    save_slot(1)
+    SAVE.saved_slots = 1
+    SAVE.next_slot = 2
+  end
+  -- Initialize feature readers
+  if CALIB.caught_counter_addr then
+    DETECT.catch.best_addr = CALIB.caught_counter_addr
+    DETECT.catch.prev_value = read_optional_u16(CALIB.caught_counter_addr)
+  end
+  if CALIB.map_id_addr then
+    DETECT.map.best_addr = CALIB.map_id_addr
+    DETECT.map.prev_value = read_optional_u16(CALIB.map_id_addr)
+  end
+  if CALIB.badge_flags_addr then
+    DETECT.badges.best_addr = CALIB.badge_flags_addr
+    DETECT.badges.prev_value = read_optional_u16(CALIB.badge_flags_addr)
+  end
   log_line('Init done; emulator=' .. EMU.name)
 end
 
 local function main_loop()
   local last_save_frame = now_frame()
   local steps = 0
-  local last_xy = { x = nil, y = nil, stagnant = 0 }
   while true do
     local frame = now_frame()
     if (frame - last_save_frame) >= CONFIG.autosave_interval_frames then
@@ -652,29 +861,75 @@ local function main_loop()
       -- Try to recalibrate occasionally
       if frame % 2000 == 0 then ensure_calibrated() end
       -- Fallback: random input to progress
-      press_button(ACTIONS[math.random(1, #ACTIONS)], CONFIG.frames_per_action)
+      exec_action_by_name(ACTIONS[math.random(1, #ACTIONS)])
       goto continue
     end
 
     -- Update phase, choose actions accordingly
-    local _prev, _cur = update_phase(x, y)
+    update_phase(x, y)
     local available_actions = get_available_actions_for_phase(PHASE.mode)
     local state_hash = hash_state(x, y)
     local eps = epsilon_for_frame(frame)
+
+    -- Choose action; if throwing a ball, record pre-snapshots for detection
     local action = choose_action(state_hash, available_actions, eps)
+    local pre_catch_before = nil
+    if action == 'BagThrowBallQuick' then
+      pre_catch_before = {}
+      for _, region in ipairs(CONFIG.calib_scan_regions) do
+        pre_catch_before[region.name] = snapshot_region(region)
+      end
+      RECENT.catch_attempt_frame = frame
+      RECENT.catch_snap_before = pre_catch_before
+    end
+
     local outcome = step_action(action)
 
-    -- Phase transition shaping
+    -- Phase transition shaping and catch detection window
     local before_mode = PHASE.mode
     local _, new_mode = update_phase(outcome.x, outcome.y)
     if before_mode == 'interaction' and new_mode == 'overworld' then
       outcome.reward = outcome.reward + CONFIG.interaction_exit_reward
+      -- If a catch attempt was recent, scan for +1 counters
+      if RECENT.catch_attempt_frame and (frame - RECENT.catch_attempt_frame) <= CONFIG.catch_attempt_window_frames and RECENT.catch_snap_before then
+        local after_snaps = {}
+        for _, region in ipairs(CONFIG.calib_scan_regions) do
+          after_snaps[region.name] = snapshot_region(region)
+        end
+        on_possible_catch_event(RECENT.catch_snap_before, after_snaps, CONFIG.calib_scan_regions)
+        RECENT.catch_attempt_frame = nil
+        RECENT.catch_snap_before = nil
+      end
     elseif new_mode == 'interaction' and (PHASE.frames_in_mode % 60 == 0) then
       outcome.reward = outcome.reward + CONFIG.long_interaction_penalty
     end
-    if new_mode == 'interaction' and PHASE.frames_in_mode >= CONFIG.max_interaction_steps_without_exit then
-      exec_action_by_name('RunFromBattle')
-      tap('B')
+
+    -- If we have a reliable caught counter, reward on increments
+    if DETECT.catch.best_addr then
+      local cur = read_optional_u16(DETECT.catch.best_addr)
+      if cur and DETECT.catch.prev_value and cur > DETECT.catch.prev_value then
+        outcome.reward = outcome.reward + CONFIG.catch_reward
+      end
+      DETECT.catch.prev_value = cur or DETECT.catch.prev_value
+    end
+
+    -- If we have a map id address, reward on new map id transitions
+    if DETECT.map.best_addr then
+      local cur = read_optional_u16(DETECT.map.best_addr)
+      if cur and DETECT.map.prev_value and cur ~= DETECT.map.prev_value then
+        outcome.reward = outcome.reward + CONFIG.new_map_reward
+      end
+      DETECT.map.prev_value = cur or DETECT.map.prev_value
+    end
+
+    -- If we have badge flags address, reward on new bits set
+    if DETECT.badges.best_addr then
+      local cur = read_optional_u16(DETECT.badges.best_addr)
+      if cur and DETECT.badges.prev_value then
+        local gained = (cur | 0) & (~(DETECT.badges.prev_value | 0))
+        if gained ~= 0 then outcome.reward = outcome.reward + CONFIG.badge_reward end
+      end
+      DETECT.badges.prev_value = cur or DETECT.badges.prev_value
     end
 
     local next_state_hash = hash_state(outcome.x, outcome.y)
@@ -684,23 +939,27 @@ local function main_loop()
     steps = steps + 1
 
     -- Stuck detection: if coarse position unchanged for long, penalize and randomize
-    if last_xy.x and last_xy.y and outcome.x == last_xy.x and outcome.y == last_xy.y then
-      last_xy.stagnant = last_xy.stagnant + 1
+    if RECENT.last_xy.x and RECENT.last_xy.y and outcome.x == RECENT.last_xy.x and outcome.y == RECENT.last_xy.y then
+      RECENT.last_xy.stagnant = RECENT.last_xy.stagnant + 1
     else
-      last_xy.stagnant = 0
+      RECENT.last_xy.stagnant = 0
     end
-    last_xy.x, last_xy.y = outcome.x, outcome.y
-    if last_xy.stagnant > 120 then
+    RECENT.last_xy.x, RECENT.last_xy.y = outcome.x, outcome.y
+    if RECENT.last_xy.stagnant > 120 then
       local s = hash_state(outcome.x, outcome.y)
       update_q(s, action, CONFIG.stuck_penalty, s)
       -- Try to break out: mash A and random direction
-      press_button('A', CONFIG.frames_per_action)
-      press_button(ACTIONS[math.random(1, 4)], CONFIG.frames_per_action)
-      last_xy.stagnant = 0
+      exec_action_by_name('A')
+      exec_action_by_name(ACTIONS[math.random(1, 4)])
+      RECENT.last_xy.stagnant = 0
     end
 
+    -- Savestates: save on progress; reset on long stagnation
+    maybe_save_progress()
+    maybe_reset_no_progress()
+
     if steps % CONFIG.log_every_n_steps == 0 then
-      log_line(string.format('step=%d eps=%.3f action=%s reward=%.3f pos=(%s) phase=%s(%d)', steps, eps, action, outcome.reward, next_state_hash, PHASE.mode, PHASE.frames_in_mode))
+      log_line(string.format('step=%d eps=%.3f action=%s reward=%.3f pos=(%s) phase=%s(%d) unique=%d', steps, eps, action, outcome.reward, next_state_hash, PHASE.mode, PHASE.frames_in_mode, PROGRESS.unique_cells_total))
     end
 
     ::continue::

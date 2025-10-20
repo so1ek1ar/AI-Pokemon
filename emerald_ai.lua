@@ -44,7 +44,11 @@ local CONFIG = {
   warp_reward = 1.0,
   new_map_reward = 1.0,
   badge_reward = 20.0,
+  frontier_entry_reward = 2.0,
   warp_distance_threshold = 24,        -- XY manhattan distance to count as warp/transition
+
+  -- Ball usage heuristics
+  ball_throw_cooldown_frames = 1200,   -- don't throw balls more often than this
 
   -- Episode management
   episode_badge_mask = 0x00FF,  -- treat all 8 badges as end condition if reachable
@@ -77,6 +81,15 @@ local CONFIG = {
     pokedex_caught_addr = nil, -- u16 counter of caught species, if known
     map_id_addr = nil,         -- u16 map id, if known
     badge_flags_addr = nil,    -- u16 bitflags for badges, if known
+  },
+
+  -- Map awareness (optional) - users can fill these
+  map_sets = {
+    center_map_ids = {},   -- e.g., [123]=true
+    mart_map_ids = {},     -- e.g., [124]=true
+    frontier_map_ids = {}, -- e.g., [200]=true
+  },
+  map_names = {            -- e.g., [123] = 'Oldale Town PokéCenter'
   },
 
   -- Logging verbosity
@@ -176,6 +189,13 @@ local function take_screenshot(tag)
     local path = string.format('%s/emerald_ai_shot_E%d_F%d_%s.png', CONFIG.save_dir, (META.episode or 0), now_frame(), tostring(tag or 'event'))
     pcall(client.screenshot, path)
   end
+end
+
+local function map_name(id)
+  if not id then return 'Unknown' end
+  local n = (CONFIG.map_names or {})[id]
+  if n then return n end
+  return string.format('Map %d', id)
 end
 
 -------------------------------------------------------------------------------
@@ -568,19 +588,41 @@ local ACTION_DEFS = {
   { name = 'Right',   phase = 'overworld',   exec = function() tap('Right', CONFIG.frames_per_action) end },
   { name = 'A',       phase = 'any',         exec = function() tap('A', CONFIG.frames_per_action) end },
   { name = 'B',       phase = 'any',         exec = function() tap('B', CONFIG.frames_per_action) end },
-  -- Interaction macros (battle/menu navigation heuristics)
-  { name = 'MenuRightA',       phase = 'interaction', exec = function() run_macro({ 'Right', 'A' }) end },
-  { name = 'MenuDownA',        phase = 'interaction', exec = function() run_macro({ 'Down', 'A' }) end },
-  { name = 'MenuLeftA',        phase = 'interaction', exec = function() run_macro({ 'Left', 'A' }) end },
-  { name = 'MenuUpA',          phase = 'interaction', exec = function() run_macro({ 'Up', 'A' }) end },
-  { name = 'RunFromBattle',    phase = 'interaction', exec = function() run_macro({ 'Down', 'Right', 'A' }) end },
-  { name = 'BagThrowBallQuick',phase = 'interaction', exec = function() run_macro({ 'Right', 'A', 'Down', 'A', 'A' }) end },
-  { name = 'FightFirst',       phase = 'interaction', exec = function() run_macro({ 'A', 'A' }) end },
+  -- Interaction and utility macros
+  { name = 'MenuRightA',        phase = 'interaction', exec = function() run_macro({ 'Right', 'A' }) end },
+  { name = 'MenuDownA',         phase = 'interaction', exec = function() run_macro({ 'Down', 'A' }) end },
+  { name = 'MenuLeftA',         phase = 'interaction', exec = function() run_macro({ 'Left', 'A' }) end },
+  { name = 'MenuUpA',           phase = 'interaction', exec = function() run_macro({ 'Up', 'A' }) end },
+  { name = 'RunFromBattle',     phase = 'interaction', exec = function() run_macro({ 'Down', 'Right', 'A' }) end },
+  { name = 'BagThrowBallQuick', phase = 'interaction', exec = function() run_macro({ 'Right', 'A', 'Down', 'A', 'A' }) end },
+  { name = 'FightFirst',        phase = 'interaction', exec = function() run_macro({ 'A', 'A' }) end },
+  -- Overworld helper macros (available conditionally)
+  { name = 'CenterHeal',        phase = 'any',         exec = function() run_macro({ 'Up', 'A', 'A', 'A', 'A', 'A', 'B' }) end },
+  { name = 'MartBuyBallsQuick', phase = 'any',         exec = function() run_macro({ 'Up', 'A', 'A', 'A', 'A', 'B', 'B' }) end },
 }
 
 local function get_available_actions_for_phase(phase)
   local list = {}
-  for _, def in ipairs(ACTION_DEFS) do if def.phase == 'any' or def.phase == phase then table.insert(list, def.name) end end
+  local mapId = (DETECT and DETECT.map and DETECT.map.prev_value) or nil
+  local mapKnown = (DETECT and DETECT.map and DETECT.map.best_addr ~= nil) and (mapId ~= nil)
+  local inCenter = false
+  local inMart = false
+  if mapId and CONFIG.map_sets then
+    inCenter = (CONFIG.map_sets.center_map_ids or {})[mapId] or false
+    inMart = (CONFIG.map_sets.mart_map_ids or {})[mapId] or false
+  end
+  for _, def in ipairs(ACTION_DEFS) do
+    if def.phase == 'any' or def.phase == phase then
+      local name = def.name
+      local allow = true
+      if name == 'CenterHeal' then
+        if mapKnown and not inCenter then allow = false end
+      elseif name == 'MartBuyBallsQuick' then
+        if mapKnown and not inMart then allow = false end
+      end
+      if allow then table.insert(list, name) end
+    end
+  end
   return list
 end
 
@@ -818,7 +860,7 @@ end
 -------------------------------------------------------------------------------
 -- Main Loop
 -------------------------------------------------------------------------------
-local RECENT = { catch_attempt_frame = nil, catch_snap_before = nil, last_xy = { x = nil, y = nil, stagnant = 0 } }
+local RECENT = { catch_attempt_frame = nil, catch_snap_before = nil, last_xy = { x = nil, y = nil, stagnant = 0 }, last_ball_throw_frame = nil }
 
 local function init()
   math.randomseed(os.time() % 2147483647)
@@ -852,11 +894,27 @@ local function main_loop()
       local eps = epsilon_for_frame(frame)
       local action = choose_action(state_hash, available_actions, eps)
 
-      -- If throwing a ball, snapshot memory before
+      -- Ball cooldown gating: avoid too-frequent ball throws
+      if action == 'BagThrowBallQuick' and RECENT.last_ball_throw_frame and (frame - RECENT.last_ball_throw_frame) < CONFIG.ball_throw_cooldown_frames then
+        local alt = {}
+        for _, a in ipairs(available_actions) do if a ~= 'BagThrowBallQuick' then table.insert(alt, a) end end
+        action = (#alt > 0) and alt[math.random(1, #alt)] or 'A'
+      end
+
+      -- If throwing a ball, snapshot memory before; mark attempt
       if action == 'BagThrowBallQuick' then
         local snaps = {}
         for _, region in ipairs(CONFIG.calib_scan_regions) do snaps[region.name] = snapshot_region(region) end
         RECENT.catch_attempt_frame = frame; RECENT.catch_snap_before = snaps
+        RECENT.last_ball_throw_frame = frame
+        journal_event('Ball throw', 'attempt')
+        take_screenshot('ball')
+      elseif action == 'CenterHeal' then
+        journal_event('Center heal macro', 'executed')
+        take_screenshot('center')
+      elseif action == 'MartBuyBallsQuick' then
+        journal_event('Mart buy balls macro', 'executed')
+        take_screenshot('mart')
       end
 
       local outcome = step_action(action)
@@ -890,11 +948,20 @@ local function main_loop()
 
       -- Map change reward / journal
       if DETECT.map.best_addr then
+        local oldm = DETECT.map.prev_value
         local curm = read_optional_u16(DETECT.map.best_addr)
-        if curm and DETECT.map.prev_value and curm ~= DETECT.map.prev_value then
+        if curm and oldm and curm ~= oldm then
           outcome.reward = outcome.reward + CONFIG.new_map_reward
-          journal_event('Map change', string.format('%d -> %d', DETECT.map.prev_value, curm))
+          journal_event('Map change', string.format('%s(%d) -> %s(%d)', map_name(oldm), oldm, map_name(curm), curm))
           take_screenshot('map')
+          -- Frontier entry shaping
+          local inFrontierPrev = (CONFIG.map_sets.frontier_map_ids or {})[oldm] or false
+          local inFrontierCur = (CONFIG.map_sets.frontier_map_ids or {})[curm] or false
+          if (not inFrontierPrev) and inFrontierCur then
+            outcome.reward = outcome.reward + (CONFIG.frontier_entry_reward or 0)
+            journal_event('Entered Frontier', string.format('%s(%d)', map_name(curm), curm))
+            take_screenshot('frontier')
+          end
         end
         DETECT.map.prev_value = curm or DETECT.map.prev_value
       end

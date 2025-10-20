@@ -30,6 +30,13 @@ local CONFIG = {
   stuck_penalty = -0.5,
   small_move_reward = 0.05,   -- tiny reward for movement (encourage walking)
 
+  -- Phase/interaction shaping
+  phase_stagnant_threshold_steps = 20, -- steps without movement to consider as interaction
+  interaction_exit_reward = 1.0,       -- reward for leaving long interaction/battle/menu phases
+  long_interaction_penalty = -0.2,     -- periodic penalty during very long interactions
+  max_interaction_steps_without_exit = 200, -- after which we inject exploration
+  macro_hold_frames = 6,               -- default hold for macro button taps
+
   -- Coordinate detection
   calib_move_frames = 18,
   calib_scan_regions = {
@@ -161,6 +168,22 @@ end
 
 local function press_button(name, hold_frames)
   press_buttons({name}, hold_frames)
+end
+
+-- Short tap helper for macros
+local function tap(name, hold_frames)
+  press_button(name, hold_frames or CONFIG.macro_hold_frames)
+end
+
+-- Run a simple macro: sequence of button names or {name, frames}
+local function run_macro(seq)
+  for _, step in ipairs(seq) do
+    if type(step) == 'table' then
+      tap(step[1], step[2])
+    else
+      tap(step)
+    end
+  end
 end
 
 -------------------------------------------------------------------------------
@@ -446,10 +469,86 @@ local function novelty_reward_for_cell(cell)
   return 0.0
 end
 
+-- Phase-aware state hash
 local function hash_state(x, y)
   if not x or not y then return 'noXY' end
-  -- Hash coarse cell to keep state small
-  return coarse_cell(x, y)
+  local cell = coarse_cell(x, y)
+  local phase = (PHASE and PHASE.mode) or 'unknown'
+  local age_bucket = math.floor(((PHASE and PHASE.frames_in_mode) or 0) / 60)
+  return string.format('%s|%s|%d', cell, phase, age_bucket)
+end
+
+-------------------------------------------------------------------------------
+-- Phase Detection and Dynamic Actions
+-------------------------------------------------------------------------------
+local PHASE = {
+  mode = 'overworld',  -- 'overworld' or 'interaction'
+  stagnant_steps = 0,
+  frames_in_mode = 0,
+  last_x = nil,
+  last_y = nil,
+}
+
+local function update_phase(x, y)
+  local prev_mode = PHASE.mode
+  if x and y and PHASE.last_x and PHASE.last_y then
+    if x == PHASE.last_x and y == PHASE.last_y then
+      PHASE.stagnant_steps = PHASE.stagnant_steps + 1
+    else
+      PHASE.stagnant_steps = 0
+    end
+  end
+  PHASE.last_x, PHASE.last_y = x, y
+
+  if PHASE.stagnant_steps >= CONFIG.phase_stagnant_threshold_steps then
+    PHASE.mode = 'interaction'
+  else
+    PHASE.mode = 'overworld'
+  end
+
+  if PHASE.mode == prev_mode then
+    PHASE.frames_in_mode = PHASE.frames_in_mode + 1
+  else
+    PHASE.frames_in_mode = 0
+  end
+  return prev_mode, PHASE.mode
+end
+
+-- Define action implementations (kept small and generic)
+local ACTION_DEFS = {
+  -- Overworld movement
+  { name = 'Up',      phase = 'overworld', exec = function() tap('Up', CONFIG.frames_per_action) end },
+  { name = 'Down',    phase = 'overworld', exec = function() tap('Down', CONFIG.frames_per_action) end },
+  { name = 'Left',    phase = 'overworld', exec = function() tap('Left', CONFIG.frames_per_action) end },
+  { name = 'Right',   phase = 'overworld', exec = function() tap('Right', CONFIG.frames_per_action) end },
+  { name = 'A',       phase = 'any',       exec = function() tap('A', CONFIG.frames_per_action) end },
+  { name = 'B',       phase = 'any',       exec = function() tap('B', CONFIG.frames_per_action) end },
+
+  -- Interaction macros (battle/menu navigation heuristics)
+  { name = 'MenuRightA', phase = 'interaction', exec = function() run_macro({ 'Right', 'A' }) end },
+  { name = 'MenuDownA',  phase = 'interaction', exec = function() run_macro({ 'Down', 'A' }) end },
+  { name = 'MenuLeftA',  phase = 'interaction', exec = function() run_macro({ 'Left', 'A' }) end },
+  { name = 'MenuUpA',    phase = 'interaction', exec = function() run_macro({ 'Up', 'A' }) end },
+  -- Run from battle (Fight/Bag/Pokemon/Run: bottom-right)
+  { name = 'RunFromBattle', phase = 'interaction', exec = function() run_macro({ 'Down', 'Right', 'A' }) end },
+  -- Attempt to throw a Poké Ball quickly: Right->Bag, A, Down (to Balls), A, A (use first ball)
+  { name = 'BagThrowBallQuick', phase = 'interaction', exec = function() run_macro({ 'Right', 'A', 'Down', 'A', 'A' }) end },
+}
+
+local function get_available_actions_for_phase(phase)
+  local list = {}
+  for _, def in ipairs(ACTION_DEFS) do
+    if def.phase == 'any' or def.phase == phase then table.insert(list, def.name) end
+  end
+  return list
+end
+
+local function exec_action_by_name(name)
+  for _, def in ipairs(ACTION_DEFS) do
+    if def.name == name then def.exec(); return end
+  end
+  -- Fallback if unknown: press as single button
+  tap(name)
 end
 
 -------------------------------------------------------------------------------
@@ -457,13 +556,13 @@ end
 -------------------------------------------------------------------------------
 local ACTIONS = { 'Up', 'Down', 'Left', 'Right', 'A', 'B' }
 
-local function choose_action(state_hash, epsilon)
+local function choose_action(state_hash, available_actions, epsilon)
   if math.random() < epsilon then
-    return ACTIONS[math.random(1, #ACTIONS)]
+    return available_actions[math.random(1, #available_actions)]
   end
   -- Greedy
-  local best_a, best_q = ACTIONS[1], -1e9
-  for _, a in ipairs(ACTIONS) do
+  local best_a, best_q = available_actions[1], -1e9
+  for _, a in ipairs(available_actions) do
     local entry = QTABLE[q_key(state_hash, a)]
     local q = entry and entry.q or 0.0
     if q > best_q then best_q = q; best_a = a end
@@ -474,9 +573,10 @@ end
 local function update_q(state_hash, action, reward, next_state_hash)
   local key = q_key(state_hash, action)
   local entry = QTABLE[key] or { q = 0.0, n = 0 }
-  -- Max over actions in next state
+  -- Max over actions in next state (consider all defined actions)
   local max_next = -1e9
-  for _, a in ipairs(ACTIONS) do
+  for _, def in ipairs(ACTION_DEFS) do
+    local a = def.name
     local e = QTABLE[q_key(next_state_hash, a)]
     local q = e and e.q or 0.0
     if q > max_next then max_next = q end
@@ -492,7 +592,7 @@ end
 
 local function step_action(action)
   local x0, y0 = get_player_xy()
-  press_button(action, CONFIG.frames_per_action)
+  exec_action_by_name(action)
   local x1, y1 = get_player_xy()
 
   local reward = 0.0
@@ -556,10 +656,27 @@ local function main_loop()
       goto continue
     end
 
+    -- Update phase, choose actions accordingly
+    local _prev, _cur = update_phase(x, y)
+    local available_actions = get_available_actions_for_phase(PHASE.mode)
     local state_hash = hash_state(x, y)
     local eps = epsilon_for_frame(frame)
-    local action = choose_action(state_hash, eps)
+    local action = choose_action(state_hash, available_actions, eps)
     local outcome = step_action(action)
+
+    -- Phase transition shaping
+    local before_mode = PHASE.mode
+    local _, new_mode = update_phase(outcome.x, outcome.y)
+    if before_mode == 'interaction' and new_mode == 'overworld' then
+      outcome.reward = outcome.reward + CONFIG.interaction_exit_reward
+    elseif new_mode == 'interaction' and (PHASE.frames_in_mode % 60 == 0) then
+      outcome.reward = outcome.reward + CONFIG.long_interaction_penalty
+    end
+    if new_mode == 'interaction' and PHASE.frames_in_mode >= CONFIG.max_interaction_steps_without_exit then
+      exec_action_by_name('RunFromBattle')
+      tap('B')
+    end
+
     local next_state_hash = hash_state(outcome.x, outcome.y)
     update_q(state_hash, action, outcome.reward, next_state_hash)
 
@@ -583,7 +700,7 @@ local function main_loop()
     end
 
     if steps % CONFIG.log_every_n_steps == 0 then
-      log_line(string.format('step=%d eps=%.3f action=%s reward=%.3f pos=(%s)', steps, eps, action, outcome.reward, next_state_hash))
+      log_line(string.format('step=%d eps=%.3f action=%s reward=%.3f pos=(%s) phase=%s(%d)', steps, eps, action, outcome.reward, next_state_hash, PHASE.mode, PHASE.frames_in_mode))
     end
 
     ::continue::
